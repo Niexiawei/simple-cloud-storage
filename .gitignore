@@ -1,0 +1,15 @@
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Go 编译与测试产物
+*.exe
+*.test
+*.out
+*.prof
+coverage.*
+
+# 系统文件
+.DS_Store
+Thumbs.db
