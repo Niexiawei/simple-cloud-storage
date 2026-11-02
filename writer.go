@@ -1,0 +1,364 @@
+package cloudstorage
+
+import (
+	"bytes"
+	"context"
+	"crypto/md5"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"hash"
+	"io"
+	"os"
+)
+
+const maxInlineUploadSize int64 = 8 << 20
+
+type writerMode uint8
+
+const (
+	writerSmall writerMode = iota
+	writerMultipart
+	writerSpool
+)
+
+type uploadWriter struct {
+	ctx      context.Context
+	client   *Client
+	key      string
+	full     string
+	opts     UploadOptions
+	mode     writerMode
+	expected *int64
+	received int64
+	uploaded int64
+
+	small   []byte
+	partBuf []byte
+	session MultipartSession
+	parts   []PartInfo
+
+	file     *os.File
+	filePath string
+	spool    io.Writer
+	md5      hash.Hash
+	sha1     hash.Hash
+	sha256   hash.Hash
+
+	info     ObjectInfo
+	err      error
+	closeErr error
+	closed   bool
+	aborted  bool
+}
+
+func (c *Client) NewWriter(ctx context.Context, key string, options WriterOptions) (UploadWriter, error) {
+	if err := c.checkResume("new writer", key, options.Resume, options.ResumeID, true); err != nil {
+		return nil, err
+	}
+	logical, full, err := c.resolve(key)
+	if err != nil {
+		return nil, err
+	}
+	opts := UploadOptions{
+		Size:               options.Size,
+		PartSize:           options.PartSize,
+		MultipartThreshold: options.MultipartThreshold,
+		Concurrency:        options.Concurrency,
+		DisableMultipart:   options.DisableMultipart,
+		TempDir:            options.TempDir,
+		MD5:                options.MD5,
+		SHA1:               options.SHA1,
+		SHA256:             options.SHA256,
+		Progress:           options.Progress,
+	}
+	if opts.PartSize == 0 {
+		opts.PartSize = c.config.PartSize
+	}
+	if opts.MultipartThreshold == 0 {
+		opts.MultipartThreshold = c.config.MultipartThreshold
+	}
+	if opts.Concurrency == 0 {
+		opts.Concurrency = c.config.Concurrency
+	}
+	if opts.TempDir == "" {
+		opts.TempDir = c.config.TempDir
+	}
+	if opts.PartSize < 1 || opts.MultipartThreshold < 1 || int64(int(opts.PartSize)) != opts.PartSize {
+		return nil, &Error{Op: "new writer", Provider: c.provider.Name(), Key: logical, Kind: ErrInvalidArgument, Err: fmt.Errorf("invalid part size or multipart threshold")}
+	}
+	if opts.Concurrency != 1 {
+		return nil, &Error{Op: "new writer", Provider: c.provider.Name(), Key: logical, Kind: ErrUnsupported, Err: fmt.Errorf("phase 1 supports concurrency=1 only")}
+	}
+	if opts.Size != nil && *opts.Size < 0 {
+		return nil, &Error{Op: "new writer", Provider: c.provider.Name(), Key: logical, Kind: ErrInvalidArgument, Err: fmt.Errorf("size is negative")}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	w := &uploadWriter{ctx: ctx, client: c, key: logical, full: full, opts: opts}
+	if opts.Size != nil {
+		size := *opts.Size
+		w.expected = &size
+		opts.Size = &size
+		w.opts.Size = &size
+	}
+	caps := c.provider.Capabilities()
+	switch {
+	case opts.Size == nil || caps.RequiresFullHash || !caps.SupportsStreamingMultipart:
+		w.mode = writerSpool
+		if err := w.initSpool(); err != nil {
+			return nil, c.wrapError("new writer", logical, err)
+		}
+	case !opts.DisableMultipart && *opts.Size >= opts.MultipartThreshold:
+		w.mode = writerMultipart
+		w.partBuf = make([]byte, 0, int(opts.PartSize))
+		session, err := c.provider.CreateMultipart(ctx, full, opts)
+		if err != nil {
+			return nil, c.wrapError("new writer", logical, err)
+		}
+		w.session = session
+	case *opts.Size <= maxInlineUploadSize:
+		w.mode = writerSmall
+		w.small = make([]byte, 0, int(*opts.Size))
+	default:
+		w.mode = writerSpool
+		if err := w.initSpool(); err != nil {
+			return nil, c.wrapError("new writer", logical, err)
+		}
+	}
+	return w, nil
+}
+
+func (w *uploadWriter) Write(p []byte) (int, error) {
+	if w.aborted {
+		return 0, ErrWriterAborted
+	}
+	if w.closed {
+		return 0, ErrWriterClosed
+	}
+	if w.err != nil {
+		return 0, w.err
+	}
+	if err := w.ctx.Err(); err != nil {
+		w.err = err
+		return 0, err
+	}
+	if w.expected != nil && int64(len(p)) > *w.expected-w.received {
+		w.err = fmt.Errorf("%w: declared=%d received would be %d", ErrSizeMismatch, *w.expected, w.received+int64(len(p)))
+		return 0, w.err
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	var n int
+	var err error
+	switch w.mode {
+	case writerSpool:
+		n, err = w.spool.Write(p)
+		if n < len(p) && err == nil {
+			err = io.ErrShortWrite
+		}
+	case writerSmall:
+		w.small = append(w.small, p...)
+		n = len(p)
+	case writerMultipart:
+		n, err = w.writeMultipart(p)
+	default:
+		err = fmt.Errorf("unknown writer mode")
+	}
+	w.received += int64(n)
+	if err != nil {
+		w.err = err
+	}
+	return n, err
+}
+
+func (w *uploadWriter) Close() error {
+	if w.closeErr != nil {
+		return w.closeErr
+	}
+	if w.aborted {
+		return ErrWriterAborted
+	}
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	if w.err != nil {
+		return w.failClose(w.err)
+	}
+	if err := w.ctx.Err(); err != nil {
+		return w.failClose(err)
+	}
+	if w.expected != nil && w.received != *w.expected {
+		return w.failClose(fmt.Errorf("%w: declared=%d received=%d", ErrSizeMismatch, *w.expected, w.received))
+	}
+
+	var info ObjectInfo
+	var err error
+	switch w.mode {
+	case writerSmall:
+		w.setHashes(w.small)
+		info, err = w.uploadPrepared(bytes.NewReader(w.small))
+	case writerMultipart:
+		if err = w.flushPart(); err == nil {
+			if err = w.ctx.Err(); err == nil {
+				info, err = w.session.Complete(w.ctx, w.parts)
+			}
+		}
+		if err == nil {
+			w.session = nil
+		}
+	case writerSpool:
+		info, err = w.closeSpool()
+	}
+	if err != nil {
+		return w.failClose(err)
+	}
+	info.Key = w.key
+	w.info = info
+	return nil
+}
+
+func (w *uploadWriter) failClose(err error) error {
+	ctx, cancel := w.client.cleanupContext(w.ctx)
+	defer cancel()
+	w.closeErr = errors.Join(err, w.abortResources(ctx))
+	return w.closeErr
+}
+
+func (w *uploadWriter) Abort(ctx context.Context) error {
+	if w.closed && w.closeErr == nil && !w.aborted {
+		return nil
+	}
+	w.aborted = true
+	w.closed = true
+	cleanupCtx, cancel := context.WithTimeout(ctx, w.client.config.CleanupTimeout)
+	defer cancel()
+	return w.abortResources(cleanupCtx)
+}
+
+func (w *uploadWriter) Info() ObjectInfo {
+	return w.info
+}
+
+func (w *uploadWriter) writeMultipart(p []byte) (int, error) {
+	written := 0
+	for len(p) > 0 {
+		n := copy(w.partBuf[len(w.partBuf):cap(w.partBuf)], p)
+		w.partBuf = w.partBuf[:len(w.partBuf)+n]
+		p = p[n:]
+		written += n
+		if len(w.partBuf) == cap(w.partBuf) {
+			if err := w.flushPart(); err != nil {
+				return written, err
+			}
+		}
+	}
+	return written, nil
+}
+
+func (w *uploadWriter) flushPart() error {
+	if err := w.ctx.Err(); err != nil {
+		return err
+	}
+	if len(w.partBuf) == 0 {
+		return nil
+	}
+	partNumber := len(w.parts) + 1
+	size := int64(len(w.partBuf))
+	part, err := w.session.UploadPart(w.ctx, partNumber, bytes.NewReader(w.partBuf), size)
+	if err != nil {
+		return err
+	}
+	part.PartNumber = partNumber
+	part.Size = size
+	w.parts = append(w.parts, part)
+	w.uploaded += size
+	if w.opts.Progress != nil {
+		w.opts.Progress(Progress{Transferred: w.uploaded, Total: *w.expected})
+	}
+	w.partBuf = w.partBuf[:0]
+	return nil
+}
+
+func (w *uploadWriter) initSpool() error {
+	f, err := os.CreateTemp(w.opts.TempDir, ".simple-cloud-storage-*.upload")
+	if err != nil {
+		return err
+	}
+	w.file = f
+	w.filePath = f.Name()
+	w.md5 = md5.New()
+	w.sha1 = sha1.New()
+	w.sha256 = sha256.New()
+	w.spool = io.MultiWriter(f, w.md5, w.sha1, w.sha256)
+	return nil
+}
+
+func (w *uploadWriter) closeSpool() (ObjectInfo, error) {
+	if err := w.file.Sync(); err != nil {
+		return ObjectInfo{}, err
+	}
+	if err := w.file.Close(); err != nil {
+		return ObjectInfo{}, err
+	}
+	w.file = nil
+	f, err := os.Open(w.filePath)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	w.opts.MD5 = hex.EncodeToString(w.md5.Sum(nil))
+	w.opts.SHA1 = hex.EncodeToString(w.sha1.Sum(nil))
+	w.opts.SHA256 = hex.EncodeToString(w.sha256.Sum(nil))
+	size := w.received
+	w.opts.Size = &size
+	info, uploadErr := w.uploadPrepared(f)
+	closeErr := f.Close()
+	removeErr := os.Remove(w.filePath)
+	if removeErr == nil || os.IsNotExist(removeErr) {
+		w.filePath = ""
+		removeErr = nil
+	}
+	return info, errors.Join(uploadErr, closeErr, removeErr)
+}
+
+func (w *uploadWriter) setHashes(data []byte) {
+	md5Sum := md5.Sum(data)
+	sha1Sum := sha1.Sum(data)
+	sha256Sum := sha256.Sum256(data)
+	w.opts.MD5 = hex.EncodeToString(md5Sum[:])
+	w.opts.SHA1 = hex.EncodeToString(sha1Sum[:])
+	w.opts.SHA256 = hex.EncodeToString(sha256Sum[:])
+}
+
+func (w *uploadWriter) abortResources(ctx context.Context) error {
+	var errs []error
+	if w.session != nil {
+		if err := w.session.Abort(ctx); err != nil {
+			errs = append(errs, err)
+		} else {
+			w.session = nil
+		}
+	}
+	if w.file != nil {
+		if err := w.file.Close(); err != nil {
+			errs = append(errs, err)
+		} else {
+			w.file = nil
+		}
+	}
+	if w.filePath != "" {
+		if err := os.Remove(w.filePath); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		} else {
+			w.filePath = ""
+		}
+	}
+	return errors.Join(errs...)
+}
