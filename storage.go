@@ -43,8 +43,9 @@ type ProgressFunc func(Progress)
 
 // UploadOptions controls a single upload. Nil Size means the size is unknown.
 type UploadOptions struct {
-	// Resume requires a CheckpointStore. Phase 1 returns ErrUnsupported before I/O.
+	// Resume requires a CheckpointStore and provider recovery support.
 	Resume             bool
+	ResumeID           string
 	Size               *int64
 	PartSize           int64
 	MultipartThreshold int64
@@ -61,7 +62,7 @@ type UploadOptions struct {
 type WriterOptions struct {
 	// Resume requires a CheckpointStore and a stable, non-empty ResumeID.
 	// It also requires a replayable source or a retained complete spool file.
-	// Phase 1 returns ErrUnsupported before creating files or remote sessions.
+	// Providers without recovery support return ErrUnsupported before transfer I/O.
 	Resume             bool
 	ResumeID           string
 	Size               *int64
@@ -84,7 +85,7 @@ type ReadOptions struct {
 
 // DownloadOptions controls downloading into a local file.
 type DownloadOptions struct {
-	// Resume requires a CheckpointStore; phase 1 returns ErrUnsupported before I/O.
+	// Resume requires a CheckpointStore and provider Range validation support.
 	Resume bool
 	// KeepPartial retains .part on failure. It alone does not enable safe resume.
 	KeepPartial bool
@@ -95,6 +96,23 @@ type DownloadOptions struct {
 type Capabilities struct {
 	SupportsStreamingMultipart bool
 	RequiresFullHash           bool
+	RequiresMultipart          bool
+	SupportsDownloadResume     bool
+}
+
+// ResumableUploader owns provider session recovery and persistent confirmed parts.
+// It must not abort a recoverable session on a transient failure. Source is complete,
+// seekable and hashed; checkpoint contains the common source identity and namespace.
+type ResumableUploader interface {
+	UploadResumable(ctx context.Context, path string, source io.ReadSeeker, opts UploadOptions, checkpoint Checkpoint, store CheckpointStore) (ObjectInfo, error)
+	AbortUpload(ctx context.Context, path string, checkpoint Checkpoint, store CheckpointStore) error
+}
+
+// PendingUpload exposes a complete retained spool after a resumable Close failure.
+// Re-upload this file with the same key and ResumeID to continue confirmed parts.
+type PendingUpload interface {
+	UploadWriter
+	ResumeSource() string
 }
 
 // Provider is the cloud-specific SPI. Paths passed to it include the normalized Prefix.
@@ -117,6 +135,9 @@ type MultipartSession interface {
 	Complete(ctx context.Context, parts []PartInfo) (ObjectInfo, error)
 	Abort(ctx context.Context) error
 }
+
+// MultipartGeometry lets a provider enforce the part size returned by its server.
+type MultipartGeometry interface{ PartSize() int64 }
 
 // UploadWriter extends io.WriteCloser with abort and result inspection.
 // Abort abandons the upload and removes local temporary resources; it is not pause.

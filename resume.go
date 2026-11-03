@@ -36,6 +36,7 @@ type UploadState struct {
 	TotalParts int64             `json:"total_parts"`
 	Completed  []PartInfo        `json:"completed"`
 	Session    map[string]string `json:"session,omitempty"`
+	Source     string            `json:"source,omitempty"`
 }
 
 // Validate rejects inconsistent part geometry and unconfirmed or duplicate progress.
@@ -236,6 +237,12 @@ func (c *Client) checkResume(op, key string, enabled bool, resumeID string, writ
 	if c.config.CheckpointStore == nil || (writer && strings.TrimSpace(resumeID) == "") {
 		return &Error{Op: op, Provider: c.provider.Name(), Key: key, Kind: ErrInvalidArgument, Err: fmt.Errorf("resume requires a checkpoint store and writers require a stable resume id")}
 	}
-	// Phase 2/3 will attach provider recovery to the common state models.
-	return &Error{Op: op, Provider: c.provider.Name(), Key: key, Kind: ErrUnsupported, Err: fmt.Errorf("resume is not implemented in phase 1")}
+	if op == "download" {
+		if c.provider.Capabilities().SupportsDownloadResume {
+			return nil
+		}
+	} else if _, ok := c.provider.(ResumableUploader); ok {
+		return nil
+	}
+	return &Error{Op: op, Provider: c.provider.Name(), Key: key, Kind: ErrUnsupported, Err: fmt.Errorf("provider does not support resume")}
 }

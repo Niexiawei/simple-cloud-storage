@@ -1,7 +1,9 @@
 package cloudstorage
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -46,7 +48,7 @@ func NewClient(provider Provider, cfg Config) (*Client, error) {
 		return nil, &Error{Op: "new client", Provider: provider.Name(), Kind: ErrInvalidArgument, Err: fmt.Errorf("part size and multipart threshold must be positive")}
 	}
 	if cfg.Concurrency != 1 {
-		return nil, &Error{Op: "new client", Provider: provider.Name(), Kind: ErrUnsupported, Err: fmt.Errorf("phase 1 supports concurrency=1 only")}
+		return nil, &Error{Op: "new client", Provider: provider.Name(), Kind: ErrUnsupported, Err: fmt.Errorf("only concurrency=1 is supported")}
 	}
 	if int64(int(cfg.PartSize)) != cfg.PartSize {
 		return nil, &Error{Op: "new client", Provider: provider.Name(), Kind: ErrInvalidArgument, Err: fmt.Errorf("part size exceeds platform int capacity")}
@@ -99,13 +101,15 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 }
 
 func (c *Client) Upload(ctx context.Context, key string, r io.Reader, opts UploadOptions) (ObjectInfo, error) {
-	if err := c.checkResume("upload", key, opts.Resume, "", false); err != nil {
+	if err := c.checkResume("upload", key, opts.Resume, opts.ResumeID, false); err != nil {
 		return ObjectInfo{}, err
 	}
 	if r == nil {
 		return ObjectInfo{}, &Error{Op: "upload", Provider: c.provider.Name(), Key: key, Kind: ErrInvalidArgument, Err: fmt.Errorf("reader is nil")}
 	}
-	w, err := c.NewWriter(ctx, key, WriterOptions{
+	w, err := c.newWriter(ctx, key, WriterOptions{
+		Resume:             opts.Resume,
+		ResumeID:           opts.ResumeID,
 		Size:               opts.Size,
 		PartSize:           opts.PartSize,
 		MultipartThreshold: opts.MultipartThreshold,
@@ -116,7 +120,7 @@ func (c *Client) Upload(ctx context.Context, key string, r io.Reader, opts Uploa
 		SHA1:               opts.SHA1,
 		SHA256:             opts.SHA256,
 		Progress:           opts.Progress,
-	})
+	}, false)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
@@ -133,7 +137,7 @@ func (c *Client) Upload(ctx context.Context, key string, r io.Reader, opts Uploa
 }
 
 func (c *Client) UploadFile(ctx context.Context, key, src string, opts UploadOptions) (ObjectInfo, error) {
-	if err := c.checkResume("upload file", key, opts.Resume, "", false); err != nil {
+	if err := c.checkResume("upload file", key, opts.Resume, opts.ResumeID, false); err != nil {
 		return ObjectInfo{}, err
 	}
 	f, err := os.Open(src)
@@ -160,8 +164,19 @@ func (c *Client) DownloadToFile(ctx context.Context, key, dst string, opts Downl
 	if err := c.checkResume("download", key, opts.Resume, "", false); err != nil {
 		return err
 	}
+	if opts.Resume {
+		return c.downloadResumable(ctx, key, dst, opts)
+	}
 	if dst == "" {
 		return &Error{Op: "download", Provider: c.provider.Name(), Key: key, Kind: ErrInvalidArgument, Err: fmt.Errorf("destination is empty")}
+	}
+	var expected *ObjectInfo
+	if c.provider.Capabilities().SupportsDownloadResume {
+		info, err := c.Stat(ctx, key)
+		if err != nil {
+			return err
+		}
+		expected = &info
 	}
 	r, err := c.Open(ctx, key, ReadOptions{})
 	if err != nil {
@@ -194,6 +209,17 @@ func (c *Client) DownloadToFile(ctx context.Context, key, dst string, opts Downl
 	}
 	if err := f.Close(); err != nil {
 		return &Error{Op: "download", Provider: c.provider.Name(), Key: key, Err: err}
+	}
+	if expected != nil {
+		local, err := os.Open(part)
+		if err != nil {
+			return err
+		}
+		verifyErr := verifyLocalHashes(ctx, local, *expected)
+		closeErr := local.Close()
+		if err := errors.Join(verifyErr, closeErr); err != nil {
+			return err
+		}
 	}
 	if err := replaceLocalFile(part, dst); err != nil {
 		return &Error{Op: "download", Provider: c.provider.Name(), Key: key, Err: err}
@@ -233,7 +259,29 @@ func (w *uploadWriter) uploadPrepared(r io.Reader) (ObjectInfo, error) {
 	if opts.Size == nil || *opts.Size < 0 {
 		return ObjectInfo{}, &Error{Op: "upload", Provider: c.provider.Name(), Key: key, Kind: ErrInvalidArgument, Err: fmt.Errorf("prepared upload requires a known non-negative size")}
 	}
-	if opts.DisableMultipart || *opts.Size < opts.MultipartThreshold {
+	if opts.Resume {
+		source, ok := r.(io.ReadSeeker)
+		provider, supported := c.provider.(ResumableUploader)
+		if !ok || !supported {
+			return ObjectInfo{}, ErrUnsupported
+		}
+		state := UploadState{Size: *opts.Size, SHA256: opts.SHA256, PartSize: opts.PartSize, Source: w.filePath}
+		if state.Size > 0 {
+			state.TotalParts = 1 + (state.Size-1)/state.PartSize
+		}
+		data, err := json.Marshal(state)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		checkpoint, err := c.newCheckpoint(ctx, key, CheckpointUpload, opts.ResumeID, data)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		info, err := provider.UploadResumable(ctx, full, source, opts, checkpoint, c.config.CheckpointStore)
+		info.Key = key
+		return info, err
+	}
+	if !c.provider.Capabilities().RequiresMultipart && (opts.DisableMultipart || *opts.Size < opts.MultipartThreshold) {
 		reader := io.Reader(r)
 		if opts.Progress != nil {
 			reader = &progressReader{ctx: ctx, r: r, total: *opts.Size, progress: opts.Progress}
@@ -251,6 +299,12 @@ func (w *uploadWriter) uploadPrepared(r io.Reader) (ObjectInfo, error) {
 		return ObjectInfo{}, err
 	}
 	w.session = session
+	if geometry, ok := session.(MultipartGeometry); ok {
+		opts.PartSize = geometry.PartSize()
+		if opts.PartSize <= 0 || int64(int(opts.PartSize)) != opts.PartSize {
+			return ObjectInfo{}, ErrProtocol
+		}
+	}
 	parts, err := uploadParts(ctx, session, r, *opts.Size, opts.PartSize, opts.Progress)
 	if err != nil {
 		return ObjectInfo{}, err
@@ -278,7 +332,7 @@ func uploadParts(ctx context.Context, session MultipartSession, r io.Reader, siz
 		if err != nil {
 			return nil, fmt.Errorf("%w: part %d read %d of %d bytes: %w", ErrSizeMismatch, partNumber, n, want, err)
 		}
-		part, err := session.UploadPart(ctx, partNumber, &contextReader{ctx: ctx, r: &sliceReader{data: buffer[:n]}}, want)
+		part, err := session.UploadPart(ctx, partNumber, bytes.NewReader(buffer[:n]), want)
 		if err != nil {
 			return nil, err
 		}
@@ -292,20 +346,6 @@ func uploadParts(ctx context.Context, session MultipartSession, r io.Reader, siz
 		}
 	}
 	return parts, nil
-}
-
-type sliceReader struct {
-	data []byte
-	off  int
-}
-
-func (r *sliceReader) Read(p []byte) (int, error) {
-	if r.off == len(r.data) {
-		return 0, io.EOF
-	}
-	n := copy(p, r.data[r.off:])
-	r.off += n
-	return n, nil
 }
 
 type contextReader struct {

@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
@@ -40,12 +41,13 @@ type uploadWriter struct {
 	session MultipartSession
 	parts   []PartInfo
 
-	file     *os.File
-	filePath string
-	spool    io.Writer
-	md5      hash.Hash
-	sha1     hash.Hash
-	sha256   hash.Hash
+	file          *os.File
+	filePath      string
+	spool         io.Writer
+	spoolComplete bool
+	md5           hash.Hash
+	sha1          hash.Hash
+	sha256        hash.Hash
 
 	info     ObjectInfo
 	err      error
@@ -55,7 +57,11 @@ type uploadWriter struct {
 }
 
 func (c *Client) NewWriter(ctx context.Context, key string, options WriterOptions) (UploadWriter, error) {
-	if err := c.checkResume("new writer", key, options.Resume, options.ResumeID, true); err != nil {
+	return c.newWriter(ctx, key, options, true)
+}
+
+func (c *Client) newWriter(ctx context.Context, key string, options WriterOptions, requireID bool) (UploadWriter, error) {
+	if err := c.checkResume("new writer", key, options.Resume, options.ResumeID, requireID); err != nil {
 		return nil, err
 	}
 	logical, full, err := c.resolve(key)
@@ -63,6 +69,8 @@ func (c *Client) NewWriter(ctx context.Context, key string, options WriterOption
 		return nil, err
 	}
 	opts := UploadOptions{
+		Resume:             options.Resume,
+		ResumeID:           options.ResumeID,
 		Size:               options.Size,
 		PartSize:           options.PartSize,
 		MultipartThreshold: options.MultipartThreshold,
@@ -90,7 +98,7 @@ func (c *Client) NewWriter(ctx context.Context, key string, options WriterOption
 		return nil, &Error{Op: "new writer", Provider: c.provider.Name(), Key: logical, Kind: ErrInvalidArgument, Err: fmt.Errorf("invalid part size or multipart threshold")}
 	}
 	if opts.Concurrency != 1 {
-		return nil, &Error{Op: "new writer", Provider: c.provider.Name(), Key: logical, Kind: ErrUnsupported, Err: fmt.Errorf("phase 1 supports concurrency=1 only")}
+		return nil, &Error{Op: "new writer", Provider: c.provider.Name(), Key: logical, Kind: ErrUnsupported, Err: fmt.Errorf("only concurrency=1 is supported")}
 	}
 	if opts.Size != nil && *opts.Size < 0 {
 		return nil, &Error{Op: "new writer", Provider: c.provider.Name(), Key: logical, Kind: ErrInvalidArgument, Err: fmt.Errorf("size is negative")}
@@ -107,8 +115,11 @@ func (c *Client) NewWriter(ctx context.Context, key string, options WriterOption
 		w.opts.Size = &size
 	}
 	caps := c.provider.Capabilities()
+	if caps.RequiresMultipart && opts.DisableMultipart {
+		return nil, ErrUnsupported
+	}
 	switch {
-	case opts.Size == nil || caps.RequiresFullHash || !caps.SupportsStreamingMultipart:
+	case opts.Resume || opts.Size == nil || caps.RequiresFullHash || !caps.SupportsStreamingMultipart:
 		w.mode = writerSpool
 		if err := w.initSpool(); err != nil {
 			return nil, c.wrapError("new writer", logical, err)
@@ -121,6 +132,13 @@ func (c *Client) NewWriter(ctx context.Context, key string, options WriterOption
 			return nil, c.wrapError("new writer", logical, err)
 		}
 		w.session = session
+		if geometry, ok := session.(MultipartGeometry); ok {
+			partSize := geometry.PartSize()
+			if partSize <= 0 || int64(int(partSize)) != partSize {
+				return nil, w.failClose(ErrProtocol)
+			}
+			w.partBuf = make([]byte, 0, int(partSize))
+		}
 	case *opts.Size <= maxInlineUploadSize:
 		w.mode = writerSmall
 		w.small = make([]byte, 0, int(*opts.Size))
@@ -226,6 +244,10 @@ func (w *uploadWriter) Close() error {
 }
 
 func (w *uploadWriter) failClose(err error) error {
+	if w.opts.Resume && w.spoolComplete {
+		w.closeErr = err
+		return err
+	}
 	ctx, cancel := w.client.cleanupContext(w.ctx)
 	defer cancel()
 	w.closeErr = errors.Join(err, w.abortResources(ctx))
@@ -240,11 +262,27 @@ func (w *uploadWriter) Abort(ctx context.Context) error {
 	w.closed = true
 	cleanupCtx, cancel := context.WithTimeout(ctx, w.client.config.CleanupTimeout)
 	defer cancel()
-	return w.abortResources(cleanupCtx)
+	var remoteErr error
+	if w.opts.Resume && w.spoolComplete {
+		checkpoint, err := w.client.newCheckpoint(cleanupCtx, w.key, CheckpointUpload, w.opts.ResumeID, json.RawMessage(`{}`))
+		if err != nil {
+			remoteErr = err
+		} else if provider, ok := w.client.provider.(ResumableUploader); ok {
+			remoteErr = provider.AbortUpload(cleanupCtx, w.full, checkpoint, w.client.config.CheckpointStore)
+		}
+	}
+	return errors.Join(remoteErr, w.abortResources(cleanupCtx))
 }
 
 func (w *uploadWriter) Info() ObjectInfo {
 	return w.info
+}
+
+func (w *uploadWriter) ResumeSource() string {
+	if w.opts.Resume && w.spoolComplete {
+		return w.filePath
+	}
+	return ""
 }
 
 func (w *uploadWriter) writeMultipart(p []byte) (int, error) {
@@ -309,6 +347,7 @@ func (w *uploadWriter) closeSpool() (ObjectInfo, error) {
 		return ObjectInfo{}, err
 	}
 	w.file = nil
+	w.spoolComplete = true
 	f, err := os.Open(w.filePath)
 	if err != nil {
 		return ObjectInfo{}, err
@@ -320,6 +359,9 @@ func (w *uploadWriter) closeSpool() (ObjectInfo, error) {
 	w.opts.Size = &size
 	info, uploadErr := w.uploadPrepared(f)
 	closeErr := f.Close()
+	if uploadErr != nil && w.opts.Resume {
+		return info, errors.Join(uploadErr, closeErr)
+	}
 	removeErr := os.Remove(w.filePath)
 	if removeErr == nil || os.IsNotExist(removeErr) {
 		w.filePath = ""
