@@ -141,26 +141,34 @@ func (r *validatedReader) Read(p []byte) (int, error) {
 		var extra [1]byte
 		n, err := r.body.Read(extra[:])
 		if n > 0 {
-			return 0, cloudstorage.ErrSizeMismatch
+			return 0, r.fail(cloudstorage.ErrSizeMismatch)
 		}
 		if errors.Is(err, io.EOF) {
 			return 0, r.finish()
 		}
-		return 0, err
+		if err != nil {
+			return 0, r.fail(safeTransport(r.ctx, err))
+		}
+		return 0, nil
 	}
 	p = p[:min(int64(len(p)), r.remaining)]
 	n, err := r.body.Read(p)
 	r.remaining -= int64(n)
 	if errors.Is(err, io.EOF) && r.remaining > 0 {
-		return n, io.ErrUnexpectedEOF
+		return n, r.fail(io.ErrUnexpectedEOF)
 	}
 	if errors.Is(err, io.EOF) {
 		return n, r.finish()
 	}
 	if err != nil && !errors.Is(err, io.EOF) {
-		return n, safeTransport(r.ctx, err)
+		return n, r.fail(safeTransport(r.ctx, err))
 	}
 	return n, err
+}
+
+func (r *validatedReader) fail(err error) error {
+	r.done, r.terminal = true, err
+	return err
 }
 
 func (r *validatedReader) finish() error {
@@ -173,4 +181,10 @@ func (r *validatedReader) finish() error {
 	}
 	return r.terminal
 }
-func (r *validatedReader) Close() error { r.cancel(); return r.body.Close() }
+func (r *validatedReader) Close() error {
+	r.cancel()
+	if err := r.body.Close(); err != nil {
+		return safeTransport(context.WithoutCancel(r.ctx), err)
+	}
+	return nil
+}
