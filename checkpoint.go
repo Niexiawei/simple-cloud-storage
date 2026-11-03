@@ -2,11 +2,15 @@ package cloudstorage
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Niexiawei/simple-cloud-storage/internal/statefile"
@@ -35,8 +39,15 @@ type CheckpointStore interface {
 	Delete(ctx context.Context, id string) error
 }
 
+// CheckpointLister optionally enumerates validated checkpoints for maintenance.
+// Listing and cleanup require exclusive access across processes to the state directory.
+type CheckpointLister interface {
+	List(ctx context.Context) ([]Checkpoint, error)
+}
+
 type fileCheckpointStore struct {
 	store *statefile.Store
+	dir   string
 }
 
 // NewFileCheckpointStore stores versioned records in dir/checkpoints.
@@ -49,7 +60,64 @@ func NewFileCheckpointStore(dir string) (CheckpointStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &fileCheckpointStore{store: store}, nil
+	return &fileCheckpointStore{store: store, dir: filepath.Join(dir, "checkpoints")}, nil
+}
+
+func (s *fileCheckpointStore) List(ctx context.Context) ([]Checkpoint, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(s.dir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	dir, err := root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	var result []Checkpoint
+	for {
+		entries, readErr := dir.ReadDir(100)
+		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			info, err := root.Lstat(entry.Name())
+			if err != nil {
+				return nil, err
+			}
+			if !info.Mode().IsRegular() {
+				return nil, ErrInvalidCheckpoint
+			}
+			data, err := root.ReadFile(entry.Name())
+			if err != nil {
+				return nil, err
+			}
+			var cp Checkpoint
+			if json.Unmarshal(data, &cp) != nil {
+				return nil, ErrInvalidCheckpoint
+			}
+			if err := cp.Validate(); err != nil {
+				return nil, err
+			}
+			sum := sha256.Sum256([]byte(cp.ID))
+			if entry.Name() != hex.EncodeToString(sum[:])+".json" {
+				return nil, ErrInvalidCheckpoint
+			}
+			result = append(result, cp)
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return result, nil
+			}
+			return nil, readErr
+		}
+	}
 }
 
 func (s *fileCheckpointStore) Load(ctx context.Context, id string) (Checkpoint, error) {

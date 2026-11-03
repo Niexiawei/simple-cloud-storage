@@ -77,6 +77,7 @@ func (c *Client) newWriter(ctx context.Context, key string, options WriterOption
 		Concurrency:        options.Concurrency,
 		DisableMultipart:   options.DisableMultipart,
 		TempDir:            options.TempDir,
+		MaxTempFileSize:    options.MaxTempFileSize,
 		MD5:                options.MD5,
 		SHA1:               options.SHA1,
 		SHA256:             options.SHA256,
@@ -94,8 +95,11 @@ func (c *Client) newWriter(ctx context.Context, key string, options WriterOption
 	if opts.TempDir == "" {
 		opts.TempDir = c.config.TempDir
 	}
-	if opts.PartSize < 1 || opts.MultipartThreshold < 1 || int64(int(opts.PartSize)) != opts.PartSize {
-		return nil, &Error{Op: "new writer", Provider: c.provider.Name(), Key: logical, Kind: ErrInvalidArgument, Err: fmt.Errorf("invalid part size or multipart threshold")}
+	if opts.MaxTempFileSize == 0 {
+		opts.MaxTempFileSize = c.config.MaxTempFileSize
+	}
+	if opts.MaxTempFileSize < 0 || opts.PartSize < 1 || opts.PartSize > MaxPartSize || opts.MultipartThreshold < 1 || int64(int(opts.PartSize)) != opts.PartSize {
+		return nil, &Error{Op: "new writer", Provider: c.provider.Name(), Key: logical, Kind: ErrInvalidArgument, Err: fmt.Errorf("invalid part size, multipart threshold or temporary file limit")}
 	}
 	if opts.Concurrency != 1 {
 		return nil, &Error{Op: "new writer", Provider: c.provider.Name(), Key: logical, Kind: ErrUnsupported, Err: fmt.Errorf("only concurrency=1 is supported")}
@@ -126,7 +130,6 @@ func (c *Client) newWriter(ctx context.Context, key string, options WriterOption
 		}
 	case !opts.DisableMultipart && *opts.Size >= opts.MultipartThreshold:
 		w.mode = writerMultipart
-		w.partBuf = make([]byte, 0, int(opts.PartSize))
 		session, err := c.provider.CreateMultipart(ctx, full, opts)
 		if err != nil {
 			return nil, c.wrapError("new writer", logical, err)
@@ -134,11 +137,12 @@ func (c *Client) newWriter(ctx context.Context, key string, options WriterOption
 		w.session = session
 		if geometry, ok := session.(MultipartGeometry); ok {
 			partSize := geometry.PartSize()
-			if partSize <= 0 || int64(int(partSize)) != partSize {
+			if partSize <= 0 || partSize > MaxPartSize || int64(int(partSize)) != partSize {
 				return nil, w.failClose(ErrProtocol)
 			}
-			w.partBuf = make([]byte, 0, int(partSize))
+			opts.PartSize = partSize
 		}
+		w.partBuf = make([]byte, 0, int(min(opts.PartSize, *opts.Size)))
 	case *opts.Size <= maxInlineUploadSize:
 		w.mode = writerSmall
 		w.small = make([]byte, 0, int(*opts.Size))
@@ -171,6 +175,10 @@ func (w *uploadWriter) Write(p []byte) (int, error) {
 	}
 	if len(p) == 0 {
 		return 0, nil
+	}
+	if w.mode == writerSpool && w.opts.MaxTempFileSize > 0 && int64(len(p)) > w.opts.MaxTempFileSize-w.received {
+		w.err = ErrTempLimit
+		return 0, w.err
 	}
 
 	var n int
@@ -206,6 +214,7 @@ func (w *uploadWriter) Close() error {
 	if w.closed {
 		return nil
 	}
+	defer w.releaseTempRegistration()
 	w.closed = true
 	if w.err != nil {
 		return w.failClose(w.err)
@@ -326,12 +335,16 @@ func (w *uploadWriter) flushPart() error {
 }
 
 func (w *uploadWriter) initSpool() error {
+	if w.opts.MaxTempFileSize > 0 && w.expected != nil && *w.expected > w.opts.MaxTempFileSize {
+		return ErrTempLimit
+	}
 	f, err := os.CreateTemp(w.opts.TempDir, ".simple-cloud-storage-*.upload")
 	if err != nil {
 		return err
 	}
 	w.file = f
 	w.filePath = f.Name()
+	activeTempUploads.Store(tempPathKey(w.filePath), true)
 	w.md5 = md5.New()
 	w.sha1 = sha1.New()
 	w.sha256 = sha256.New()
@@ -364,6 +377,7 @@ func (w *uploadWriter) closeSpool() (ObjectInfo, error) {
 	}
 	removeErr := os.Remove(w.filePath)
 	if removeErr == nil || os.IsNotExist(removeErr) {
+		w.releaseTempRegistration()
 		w.filePath = ""
 		removeErr = nil
 	}
@@ -399,8 +413,15 @@ func (w *uploadWriter) abortResources(ctx context.Context) error {
 		if err := os.Remove(w.filePath); err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err)
 		} else {
+			w.releaseTempRegistration()
 			w.filePath = ""
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (w *uploadWriter) releaseTempRegistration() {
+	if w.filePath != "" {
+		activeTempUploads.Delete(tempPathKey(w.filePath))
+	}
 }

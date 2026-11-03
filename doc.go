@@ -6,4 +6,6 @@
 // capable providers. Providers without recovery support reject Resume before I/O.
 // A CheckpointStore alone does not enable resume. Abort abandons an operation;
 // recoverable failures retain confirmed progress and complete spooled sources.
+// Spool files can be bounded using Config.MaxTempFileSize. CleanupTempUploads
+// supports explicit age-based maintenance with checkpoint and active-source protection.
 package cloudstorage

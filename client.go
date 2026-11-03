@@ -44,8 +44,8 @@ func NewClient(provider Provider, cfg Config) (*Client, error) {
 	if cfg.CleanupTimeout == 0 {
 		cfg.CleanupTimeout = DefaultCleanupTimeout
 	}
-	if cfg.PartSize < 1 || cfg.MultipartThreshold < 1 {
-		return nil, &Error{Op: "new client", Provider: provider.Name(), Kind: ErrInvalidArgument, Err: fmt.Errorf("part size and multipart threshold must be positive")}
+	if cfg.PartSize < 1 || cfg.PartSize > MaxPartSize || cfg.MultipartThreshold < 1 || cfg.MaxTempFileSize < 0 {
+		return nil, &Error{Op: "new client", Provider: provider.Name(), Kind: ErrInvalidArgument, Err: fmt.Errorf("invalid part size, multipart threshold or temporary file limit")}
 	}
 	if cfg.Concurrency != 1 {
 		return nil, &Error{Op: "new client", Provider: provider.Name(), Kind: ErrUnsupported, Err: fmt.Errorf("only concurrency=1 is supported")}
@@ -116,6 +116,7 @@ func (c *Client) Upload(ctx context.Context, key string, r io.Reader, opts Uploa
 		Concurrency:        opts.Concurrency,
 		DisableMultipart:   opts.DisableMultipart,
 		TempDir:            opts.TempDir,
+		MaxTempFileSize:    opts.MaxTempFileSize,
 		MD5:                opts.MD5,
 		SHA1:               opts.SHA1,
 		SHA256:             opts.SHA256,
@@ -301,7 +302,7 @@ func (w *uploadWriter) uploadPrepared(r io.Reader) (ObjectInfo, error) {
 	w.session = session
 	if geometry, ok := session.(MultipartGeometry); ok {
 		opts.PartSize = geometry.PartSize()
-		if opts.PartSize <= 0 || int64(int(opts.PartSize)) != opts.PartSize {
+		if opts.PartSize <= 0 || opts.PartSize > MaxPartSize || int64(int(opts.PartSize)) != opts.PartSize {
 			return ObjectInfo{}, ErrProtocol
 		}
 	}
@@ -319,7 +320,7 @@ func (w *uploadWriter) uploadPrepared(r io.Reader) (ObjectInfo, error) {
 }
 
 func uploadParts(ctx context.Context, session MultipartSession, r io.Reader, size, partSize int64, progress ProgressFunc) ([]PartInfo, error) {
-	buffer := make([]byte, int(partSize))
+	buffer := make([]byte, int(min(partSize, size)))
 	remaining := size
 	parts := make([]PartInfo, 0)
 	var uploaded int64

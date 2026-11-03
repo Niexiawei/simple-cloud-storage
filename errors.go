@@ -21,6 +21,7 @@ var (
 	ErrSizeMismatch      = errors.New("cloud storage: size mismatch")
 	ErrProtocol          = errors.New("cloud storage: invalid provider protocol")
 	ErrSessionExpired    = errors.New("cloud storage: upload session expired")
+	ErrTempLimit         = errors.New("cloud storage: temporary upload size limit exceeded")
 )
 
 // Error adds operation and provider context while preserving errors.Is checks.

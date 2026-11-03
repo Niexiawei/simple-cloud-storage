@@ -11,6 +11,8 @@ const (
 	DefaultMultipartThreshold int64 = 20 << 20
 	DefaultUploadConcurrency        = 1
 	DefaultCleanupTimeout           = 5 * time.Second
+	// MaxPartSize bounds each multipart data buffer, including provider geometry.
+	MaxPartSize int64 = 128 << 20
 )
 
 // ObjectInfo describes a cloud object. Key is always relative to Client Prefix.
@@ -52,6 +54,7 @@ type UploadOptions struct {
 	Concurrency        int
 	DisableMultipart   bool
 	TempDir            string
+	MaxTempFileSize    int64 // Per-upload spool limit in bytes; zero inherits Config.
 	MD5                string
 	SHA1               string
 	SHA256             string
@@ -71,6 +74,7 @@ type WriterOptions struct {
 	Concurrency        int
 	DisableMultipart   bool
 	TempDir            string
+	MaxTempFileSize    int64 // Per-upload spool limit in bytes; zero inherits Config.
 	MD5                string
 	SHA1               string
 	SHA256             string
@@ -166,6 +170,7 @@ type Config struct {
 	MultipartThreshold int64
 	Concurrency        int
 	TempDir            string
+	MaxTempFileSize    int64 // Zero means unlimited; negative values are invalid.
 	CheckpointStore    CheckpointStore
 	// CleanupTimeout bounds remote cleanup, including after cancellation.
 	// Zero selects DefaultCleanupTimeout; negative values are invalid.
