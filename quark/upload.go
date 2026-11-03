@@ -176,7 +176,7 @@ func (p *Provider) Upload(ctx context.Context, full string, r io.Reader, opts cl
 	}
 	var parts []cloudstorage.PartInfo
 	if !s.instant {
-		buffer := make([]byte, int(s.record.PartSize))
+		buffer := make([]byte, int(min(s.record.PartSize, *opts.Size)))
 		for remaining, number := *opts.Size, 1; remaining > 0; number++ {
 			want := min(s.record.PartSize, remaining)
 			if _, err := io.ReadFull(r, buffer[:want]); err != nil {

@@ -111,7 +111,7 @@ func (p *Provider) uploadResumable(ctx context.Context, full string, source io.R
 		opts.Progress(cloudstorage.Progress{Transferred: transferred, Total: state.Size})
 	}
 	if !session.instant && !session.record.Committed {
-		buffer := make([]byte, int(state.PartSize))
+		buffer := make([]byte, int(min(state.PartSize, state.Size)))
 		for number := int64(1); number <= state.TotalParts; number++ {
 			if err := ctx.Err(); err != nil {
 				return cloudstorage.ObjectInfo{}, err
