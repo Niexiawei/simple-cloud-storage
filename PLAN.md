@@ -1,6 +1,6 @@
 # simple-cloud-storage 实施计划
 
-> 状态：阶段 1（含补充）已完成；阶段 2 待实施  
+> 状态：阶段 1（含补充）已完成；阶段 3 代码、模拟及基础真实文件验证已完成，真实中断续传待验收；阶段 2 待实施
 > 目标项目：`D:/golang/simple-cloud-storage`  
 > 协议参考：`D:/golang/alist`  
 > 范围：仅包含独立第三方库自身的设计、实现、测试与发布，不包含任何业务项目对接。  
@@ -306,9 +306,11 @@ Go 中使用 `io.Writer/io.WriteCloser` 语义，不定义字面上的 `os.Write
 
 ```text
 目标文件.part
-目标文件.resume.json
+CheckpointStore 中的下载记录
 目标文件
 ```
+
+阶段 3 实现采用统一 CheckpointStore 保存下载记录；夸克连接默认写入当前运行目录的 `.simple-cloud-storage/checkpoints/`，不再额外维护目标旁的 `.resume.json` 副本。`.part` 始终位于目标文件旁，恢复前校验记录中的目标绑定。
 
 checkpoint 至少记录：Provider、账号身份、完整云盘路径、文件 ID、大小、ETag/修改时间和已写偏移。
 
@@ -484,9 +486,49 @@ checkpoint 至少记录：Provider、账号身份、完整云盘路径、文件 
 
 ### 阶段 3：夸克
 
-- 完成 Cookie 管理、目录 ID 解析和 prefix 根目录管理。
-- 完成 PRE 到 Finish 的状态机、暂存 Writer 和上传续传。
-- 完成 Range 下载、下载续传及真实账号验证。
+> 按用户要求先于阶段 2 实施。状态：代码、模拟及基础真实文件验证已完成，真实中断续传和长期会话续期待验收。
+
+- [x] Cookie 参数/环境变量配置、启动校验、刷新和默认持久化。
+- [x] 目录 ID 解析、分页、prefix 根目录与子目录创建、并发建目录防重。
+- [x] PRE、Hash、Auth、Part、Commit、Finish，服务器分片大小、秒传和完成可读性确认。
+- [x] 暂存 Writer、完整源保留、上传 checkpoint、跨连接恢复和显式 Abort。
+- [x] 流式 Open、严格 Range 校验、对象身份检查、下载续传与本地哈希校验。
+- [x] 模拟协议/故障测试、竞态检测、静态检查和运行时配置示例。
+- [x] 真实账号目录、视频上传/下载、Cookie 主动刷新落盘重连及 Range/哈希校验。
+- [ ] 真实中断续传、跨进程未完成分片会话恢复及长期会话续期验证。
+
+连接与 Cookie 约定：
+
+- `drivers.Connect` 根据运行时 Config.Provider 或 `CLOUD_STORAGE_PROVIDER` 选择驱动，当前内置 `quark`；也可直接调用 `quark.Connect`，或用 `quark.New` 注入公共 Client。
+- 连接参数 `quark.Config.Cookies` 优先；未提供时读取 `QUARK_COOKIES`，兼容 `QUARK_COOKIE`，再尝试本地已持久化 Cookie。凭据在建立连接时读取，不需要修改源码或重新编译。
+- 默认 Cookie 文件是当前运行目录下的 `quark-cookies.json`，可通过 CookieFile 或 `QUARK_COOKIE_FILE` 覆盖。相同初始 Cookie 再次启动时优先加载文件中的较新刷新值；不同初始 Cookie 重新校验账号。
+- 启动流程与参考驱动一致，使用网盘 `/config` 初始化并刷新会话 Cookie，默认不请求 `/account/info`；显式 AccountURL 可额外启用账号接口校验。续传标识优先使用 `__uid`，缺失时使用持久化初始 Cookie 指纹派生的隔离标识。默认每 100 分钟继续刷新；请求快照、响应 Cookie 合并及落盘保持一致，刷新不会回滚并发请求已更新的值。
+- 凭据文件使用临时文件、Sync、关闭后替换，只有验证成功的初始凭据才会落盘；持久化失败向调用方返回，后台失败可查询 LastRefreshError。Close 或连接 context 取消负责终止刷新任务。
+- 下载签名和数据请求始终使用同一 Cookie 快照；控制面与 PRE 不跟随重定向，下载只允许可信域名内的受限重定向。长期登录凭据失效需更新 Cookie 并重连。
+
+上传/下载恢复约定：
+
+- 公共层通过最小 ResumableUploader 接口接入恢复能力，其他 Provider 继续明确拒绝不支持的 Resume。夸克必须先得到完整哈希并使用服务端 PartSize；当前保持顺序分片。
+- 上传 checkpoint 保存 Provider/账号/完整路径/内容身份及已确认分片和非敏感任务标识。`auth_info`、callback 等私密数据单独写入 TokenStore，默认位于当前运行目录的 `.simple-cloud-storage/tokens/`，checkpoint 不保存 Cookie、签名或临时 URL。
+- 恢复时校验大小、SHA-256 与会话绑定；协议未提供可靠分片查询时使用已确认本地记录，未确认片可按原编号重传。签名每次重新获取；只在明确失效且原 FID 不存在时重建会话。
+- Commit/Finish 的结果不确定时先确认原 FID 可读，避免盲目新建上传。确认成功后才清理 checkpoint/私密会话；源变化、对象变化和目标变化返回明确错误。
+- 可恢复的 Close 失败保留完整暂存源，通过 PendingUpload.ResumeSource 获取；后续使用同键、同 ResumeID 重传完整源即可恢复云端进度。显式 Abort 放弃会话并清除其状态。对作为 UploadFile 输入的旧源副本不擅自删除，通用残留扫描仍属于阶段 4。
+- 下载使用 `.part` 实际大小与 checkpoint 的共同有效偏移；必须校验 206、Content-Range、总大小与对象版本，拒绝把 200 追加到旧文件，完成后校验可用哈希并改名。
+
+验收记录（2026-11-02）：
+
+- 正式模拟测试覆盖 Cookie 环境变量/默认路径、刷新落盘与旧环境值回滚防护、乱序响应与持久化失败、刷新任务退出、并发目录创建、PRE 丢包/重定向禁止重放、签名重取与 Retry-After、秒传与空文件、跨连接上传恢复、失效会话重建、Commit/Finish 响应丢失、已提交任务继续 Finish、清理失败保留确认记录、Writer Abort、下载中断和错误 Range、长数据流不受控制面总超时截断、源/对象/目标变化、凭据脱敏与可信下载重定向。
+- 已通过 `go test ./...`、`go test -race -p 1 ./...` 和 `go vet ./...`；运行时示例位于 `examples/quark/main.go`，配置说明位于 README。
+- 当前执行沙箱禁止回环 TCP 连接，模拟服务通过内存 HTTP 传输验证相同处理逻辑。真实账号只读验证入口为 TestLiveAccountReadOnly，需主动设置 `QUARK_LIVE_TEST=1` 并配置本地 Cookie。
+- 当前环境未配置真实账号 Cookie，真实服务验证未执行，阶段 3 不标记为全部验收完成；非官方 Web 协议对账号类型、会话有效期及恢复能力的限制仍需真实账号验证。
+
+真实验收补充（2026-11-03）：
+
+- 使用已持久化 Cookie 和 `D:\input.mp4`（77,850,522 字节）完成目录创建、分片上传、已完成任务跨进程确认、Cookie 刷新落盘重连、首/中/尾 Range、完整下载 SHA-256 比对及删除确认；`TestLiveQuarkInputMP4` 通过。
+- 修正 PRE 实际返回 `http://pds.quark.cn` 被域名校验拒绝的问题，补齐夸克 PDS 上传域名并强制 HTTPS。
+- 获取下载链接时按参考驱动覆盖为夸克客户端 User-Agent，与数据请求一致，修正真实服务返回 `23018` 导致上传可读性确认失败的问题。
+- 补充上传/列表/Range 错误上下文及确认重试后的原始错误保留；不输出 Cookie、私密签名或响应正文。
+- 测试支持 `QUARK_TEST_RUN_ID` 复用日志中的任务目录，避免排查时重复上传；真实未完成分片中断恢复和长期定时续期仍未验收。
 
 ### 阶段 4：稳定性收尾
 
