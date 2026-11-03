@@ -2,7 +2,7 @@
 
 独立 Go 云盘存储库，已实现公共骨架及夸克 Web 驱动，支持统一 prefix、流式 Writer、分片上传、上传/下载 checkpoint 和运行时 Cookie 配置。当前并发数为 1。
 
-阶段 3 按需求先于阶段 2 实施，阿里云盘 Open 尚未实现。夸克已通过模拟协议与故障测试，以及真实视频上传、Cookie 重连、Range 和下载哈希验证；真实中断续传仍待验收。协议参考 [AList Quark 驱动](https://github.com/AlistGo/alist/tree/main/drivers/quark_uc)，运行时不依赖 AList。
+阿里云盘 Open 按用户要求暂缓，当前仅提供夸克驱动。夸克已通过模拟协议与故障测试，以及真实视频上传、Cookie 重连、Range 和下载哈希验证。阶段 4 已补充暂存限制、残留清理及模拟跨进程中断恢复；真实中断续传仍待验收。协议参考 [AList Quark 驱动](https://github.com/AlistGo/alist/tree/main/drivers/quark_uc)，运行时不依赖 AList。
 
 ## 夸克：运行时配置与 Cookie 持久化
 
@@ -93,6 +93,7 @@ func newStorage(provider cloudstorage.Provider, stateDir string) (*cloudstorage.
 ## 当前行为与限制
 
 - 仅支持 `Concurrency=1`，其他值返回 `ErrUnsupported`。
+- `PartSize` 与 Provider 返回的分片大小上限均为 `MaxPartSize`（128 MiB），配置超限返回 `ErrInvalidArgument`，服务端超限返回 `ErrProtocol` 并清理会话。小文件只分配实际所需的分片数据缓冲区；分片元数据仍随分片数增长，此限制不代表进程总内存上限。
 - `CleanupTimeout` 零值为 5 秒，负值非法。自动清理使用独立期限；显式 `Abort(ctx)` 同时遵守调用方期限。Provider 必须响应 context 取消。
 - 未知大小、需要完整哈希等输入使用本地临时文件暂存；`Close` 负责最终提交，失败后可调用 Abort 重试清理。Writer 的方法需串行调用。
 - `UploadOptions.Resume`、`WriterOptions.Resume`、`DownloadOptions.Resume` 默认关闭。启用时必须有 CheckpointStore，Writer 还须提供稳定 ResumeID；`quark.Connect`/`drivers.Connect` 默认提供文件 Store。不支持恢复的自定义 Provider 会在传输 I/O 前返回 `ErrUnsupported`。
@@ -102,7 +103,29 @@ func newStorage(provider cloudstorage.Provider, stateDir string) (*cloudstorage.
 - Writer 的完整暂存源在可恢复的 Close 失败后保留，可通过 `writer.(cloudstorage.PendingUpload).ResumeSource()` 获取，再用相同逻辑键和 `UploadOptions{Resume:true, ResumeID:原标识}` 上传该文件。上传输入文件不会被库删除，恢复后由调用方清理旧源副本。显式 Abort 会放弃会话并清理其 checkpoint 与暂存文件。
 - 续传下载使用 `dst.part` 和配置的 CheckpointStore，从本地大小与已确认偏移的较小值继续。严格校验 206、Content-Range 和长度；对象版本或目标变化时拒绝追加，完成后校验可用哈希再改名。
 - `DownloadOptions.KeepPartial` 控制非续传下载失败是否保留 `.part`；续传模式始终保留已确认进度。没有 checkpoint 的 `.part` 不会被盲目追加。
-- 下载 URL 每次重新获取，实际下载使用生成 URL 时的 Cookie 快照；关闭 Reader 会取消读取。尚未提供通用残留暂存文件扫描、多实例上传锁或并行下载。
+- 下载 URL 每次重新获取，实际下载使用生成 URL 时的 Cookie 快照；关闭 Reader 会取消读取。正文、尾部及 Close 的传输错误均脱敏。尚未提供多实例上传锁或并行下载。
+
+## 暂存限额与残留清理
+
+`Config.MaxTempFileSize` 为**每次上传**的暂存字节上限，零值不限额；`UploadOptions` 和 `WriterOptions` 的同名正值可覆盖它。已知大小超限时不创建暂存文件；未知大小的 Write 若会越限，该次 Write 返回 `0, ErrTempLimit`，Close 保留错误并释放资源。此前成功接收的数据不会被误报为成功上传。限额只约束本地暂存，不约束直接流式上传或同进程所有上传的总磁盘使用量。
+
+`CleanupTempUploads` 用于显式维护专用 TempDir，先预览候选，再执行同样条件的清理：
+
+```go
+opts := cloudstorage.TempCleanupOptions{
+    MinAge: 24 * time.Hour,
+    DryRun: true,
+    Checkpoints: checkpoints, // NewFileCheckpointStore 支持可选 CheckpointLister。
+    Keep: pendingSources,    // 还未写入 checkpoint 的完整恢复源等。
+}
+files, err := cloudstorage.CleanupTempUploads(ctx, tempDir, opts)
+// 检查 err 和 files；确认候选后设置 opts.DryRun=false 再调用。
+// files[i].Removed 表示该文件已被删除；错误时可能已有部分候选被处理。
+```
+
+只扫描该目录下一层 `.simple-cloud-storage-*.upload` 普通文件，保留未达到 MinAge 的文件、checkpoint 引用源、Keep 指定源及本进程活动 Writer。符号链接、子目录、下载 `.part`、Cookie、私密会话和 checkpoint 文件不会被删除。损坏或无法读取的 checkpoint 会阻止清理；不支持枚举的自定义 Store 返回 `ErrUnsupported`。
+
+维护前须停止其他使用该目录的进程，并提供共享该目录的所有 checkpoint 来源。Checkpoints 参数接收一个 Store，其他 Store 的恢复源应加入 Keep。年龄不是废弃证明；本进程已经 Close 失败的 Writer 若尚未保存 checkpoint，也必须将其 `PendingUpload.ResumeSource()` 加入 Keep。此接口不自动启动扫描，不清理远端会话。
 
 ## 文件存储与格式变更
 
@@ -118,6 +141,7 @@ checkpoint 外壳版本为 1，绑定操作类型、Provider、账号、云盘�
 go test ./...
 go test -race ./...
 go vet ./...
+go test -tags=integration ./quark -run '^TestUploadSurvivesProcessExit$' -count=1 -v
 ```
 
 Windows 的 ThreadSanitizer 若出现地址分配失败，可使用 `go test -race -p 1 ./...` 逐包执行。模拟协议测试使用内存 HTTP 传输，无需外网或本地 TCP 权限。
@@ -140,5 +164,14 @@ go test -tags=integration ./quark -run '^TestLiveQuarkInputMP4$' -count=1 -v -ti
 成功后默认删除测试对象并验证不存在，空测试目录可能保留；设置 `$env:QUARK_TEST_KEEP_REMOTE='1'` 可保留云端文件。失败时保留云端对象和持久化状态用于排查；临时下载副本仍由 Go 测试清理。此测试通过 `Resume:true` 运行，但不主动制造断流，不等同于跨进程故障恢复验收。
 
 2026-11-03 已使用 77,850,522 字节的 `D:\input.mp4` 完成真实验证，下载 SHA-256 与源文件一致。上传支持 PRE 返回的夸克 PDS 和阿里云 OSS 地址，统一使用 HTTPS；获取下载链接与数据读取均使用参考驱动的夸克客户端 User-Agent。
+
+阶段 4 的真实中断测试为 `TestLiveQuarkInterruptedResume`，默认不运行。它在 `.simple-cloud-storage/phase4-<运行标识>/` 制作随机化文件副本，上传和下载各在 checkpoint 落盘后直接退出子进程，再启动新进程恢复；成功时校验原 FID、完整 SHA-256 和状态清理，并按 `QUARK_TEST_KEEP_REMOTE` 决定是否删除本次云端对象。原始 `D:\input.mp4` 保持只读。失败时保留测试副本及状态，可能占用约源文件数倍的磁盘空间。截至 2026-11-03，该真实中断测试尚未验收。
+
+```powershell
+$env:QUARK_LIVE_RESUME_TEST = '1'
+go test -tags=integration ./quark -run '^TestLiveQuarkInterruptedResume$' -count=1 -v -timeout=2h
+```
+
+模拟跨进程测试已验证原会话复用和确认分片跳过；真实长期会话续期仍须单独验收。刷新生命周期回归使用虚拟时钟覆盖 100 分钟周期与取消，不需要实际等待 100 分钟。
 
 详细范围及后续安排见 [PLAN.md](PLAN.md)。
