@@ -13,3 +13,8 @@ coverage.*
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# Quark credentials and resumable state
+quark-cookies.json
+.quark-cookie-*.tmp
+.simple-cloud-storage/
